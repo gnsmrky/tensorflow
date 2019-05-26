@@ -39,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import org.tensorflow.lite.Interpreter;
+import org.tensorflow.lite.Tensor;
 import org.tensorflow.lite.gpu.GpuDelegate;
 import org.tensorflow.lite.nnapi.NnApiDelegate;
 
@@ -85,6 +86,9 @@ public abstract class ImageClassifier {
   private static final int FILTER_STAGES = 3;
   private static final float FILTER_FACTOR = 0.4f;
 
+  // ssbo
+  private int inputSsboId = 0;
+
   private PriorityQueue<Map.Entry<String, Float>> sortedLabels =
       new PriorityQueue<>(
           RESULTS_TO_SHOW,
@@ -123,7 +127,12 @@ public abstract class ImageClassifier {
       Log.e(TAG, "Image classifier has not been initialized; Skipped.");
       builder.append(new SpannableString("Uninitialized Classifier."));
     }
+
+    // add measurement for pixel copy
+    long pixelCopyStart = SystemClock.uptimeMillis();
     convertBitmapToByteBuffer(bitmap);
+    long pixelCopyEnd = SystemClock.uptimeMillis();
+
     // Here's where the magic happens!!!
     long startTime = SystemClock.uptimeMillis();
     runInference();
@@ -136,7 +145,36 @@ public abstract class ImageClassifier {
     // Print the results.
     printTopKLabels(builder);
     long duration = endTime - startTime;
-    SpannableString span = new SpannableString(duration + " ms");
+    SpannableString span = new SpannableString(duration + " ms" + "     copy time: " + (pixelCopyEnd - pixelCopyStart) + "ms");
+    span.setSpan(new ForegroundColorSpan(android.graphics.Color.LTGRAY), 0, span.length(), 0);
+    builder.append(span);
+  }
+
+  // classify a frame using SSBO
+  void classifyFrameSSBO(SpannableStringBuilder builder, long copyTime) {
+    if (tflite == null) {
+      Log.e(TAG, "Image classifier has not been initialized; Skipped.");
+      builder.append(new SpannableString("Uninitialized Classifier."));
+    }
+
+    // add measurement for pixel copy
+    //long pixelCopyStart = SystemClock.uptimeMillis();
+    //convertBitmapToByteBuffer(bitmap);
+    //long pixelCopyEnd = SystemClock.uptimeMillis();
+
+    // Here's where the magic happens!!!
+    long startTime = SystemClock.uptimeMillis();
+    runInference();
+    long endTime = SystemClock.uptimeMillis();
+    Log.d(TAG, "Timecost to run model inference: " + Long.toString(endTime - startTime));
+
+    // Smooth the results across frames.
+    applyFilter();
+
+    // Print the results.
+    printTopKLabels(builder);
+    long duration = endTime - startTime;
+    SpannableString span = new SpannableString(duration + " ms" + "     copy time: " + (copyTime) + "ms");
     span.setSpan(new ForegroundColorSpan(android.graphics.Color.LTGRAY), 0, span.length(), 0);
     builder.append(span);
   }
@@ -167,14 +205,30 @@ public abstract class ImageClassifier {
     if (tflite != null) {
       tflite.close();
       tflite = new Interpreter(tfliteModel, tfliteOptions);
+
+      // binding input ssbo
+      if (inputSsboId != 0) {
+        Tensor inputTensor = tflite.getInputTensor(0);
+        gpuDelegate.bindGlBufferToTensor(inputTensor, inputSsboId);
+
+        tflite.modifyGraphWithDelegate(gpuDelegate);
+      }
     }
   }
 
   public void useGpu() {
     if (gpuDelegate == null) {
       gpuDelegate = new GpuDelegate();
-      tfliteOptions.addDelegate(gpuDelegate);
-      recreateInterpreter();
+      //tfliteOptions.addDelegate(gpuDelegate);
+      //recreateInterpreter();
+
+      // if no input ssbo, use the option to add gpu delegate
+      if (inputSsboId == 0) {
+        tfliteOptions.addDelegate(gpuDelegate);
+        recreateInterpreter();
+      } else {
+        recreateInterpreter();
+      }
     }
   }
 
@@ -238,6 +292,7 @@ public abstract class ImageClassifier {
     }
     imgData.rewind();
     bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
+
     // Convert the image to floating point.
     int pixel = 0;
     long startTime = SystemClock.uptimeMillis();
@@ -367,4 +422,9 @@ public abstract class ImageClassifier {
   protected int getNumLabels() {
     return labelList.size();
   }
+
+
+  // set the SSBO to be bound with
+  public void setInputSsboId (int ssboId) {    inputSsboId = ssboId;  }
+  public int  getInputSsboId () { return inputSsboId; }
 }

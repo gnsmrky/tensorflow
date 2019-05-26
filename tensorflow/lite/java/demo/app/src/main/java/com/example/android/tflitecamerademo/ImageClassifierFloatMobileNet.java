@@ -94,6 +94,11 @@ public class ImageClassifierFloatMobileNet extends ImageClassifier {
 
   @Override
   protected void runInference() {
-    tflite.run(imgData, labelProbArray);
+    if (getInputSsboId() == 0) {
+      tflite.run(imgData, labelProbArray);
+    } else {
+      // run inference for the pixels in SSBO
+      tflite.run(null, labelProbArray);
+    }
   }
 }

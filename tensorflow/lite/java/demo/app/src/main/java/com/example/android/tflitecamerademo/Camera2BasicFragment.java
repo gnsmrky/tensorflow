@@ -41,9 +41,18 @@ import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.ImageReader;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLExt;
+import android.opengl.EGLSurface;
+import android.opengl.GLES11Ext;
+import android.opengl.GLES31;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.support.annotation.NonNull;
 import android.support.v4.content.ContextCompat;
 import android.text.SpannableString;
@@ -63,6 +72,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 import android.support.v13.app.FragmentCompat;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -70,6 +81,11 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+
+import static android.opengl.EGL14.EGL_NO_CONTEXT;
+import static android.opengl.GLES30.GL_STREAM_COPY;
+import static android.opengl.GLES31.GL_COMPUTE_SHADER;
+import static android.opengl.GLES31.GL_SHADER_STORAGE_BUFFER;
 
 /** Basic fragments for the Camera. */
 public class Camera2BasicFragment extends Fragment
@@ -132,6 +148,22 @@ public class Camera2BasicFragment extends Fragment
   private String nnApi;
   private String mobilenetV1Quant;
   private String mobilenetV1Float;
+
+  // GLES & SSBO
+  EGLDisplay eglDisplay = null;
+  EGLSurface eglSurface = null;
+  EGLContext eglContext = null;
+  EGLConfig  eglConfig  = null;
+
+  EGLDisplay gpuDisplay = null;
+  EGLSurface gpuSurface = null;
+  EGLContext gpuContext = null;
+  EGLConfig  gpuConfig  = null;
+
+  int camTexId = 0;
+  int camSsboId = 0;
+  int camToSsboProgId = 0;
+  SurfaceTexture camSurfTex = null;
 
 
 
@@ -372,7 +404,33 @@ public class Camera2BasicFragment extends Fragment
           showToast("gpu requires float model.");
           classifier = null;
         } else {
+          //classifier.useGpu();
+
+          // useGpu() calls modifyGraphWithDelegate(), which changes the current gles context.
+          //     this makes current context no longer available to current thread.
+          //     one way to work around this is to create a new context and share the previously
+          //     created context.
+          EGLDisplay[] display = new EGLDisplay[1];
+          EGLContext[] context = new EGLContext[1];
+          EGLConfig [] config  = new EGLConfig [1];
+          EGLSurface[] surface = new EGLSurface[1];
+
+          initGLES(context, display, config, surface, eglContext);
+          gpuDisplay = display[0];
+          gpuContext = context[0];
+          gpuConfig  = config [0];
+          gpuSurface = surface[0];
+
+          // make the gpu context current before calling useGpu(), which in turn calls
+          //      modifyGraphWithDelegate()
+          EGL14.eglMakeCurrent(gpuDisplay, gpuSurface, gpuSurface, gpuContext);
+
+          // set the SSBO
+          classifier.setInputSsboId(camSsboId);
           classifier.useGpu();
+
+          // resumes normal egl context
+          EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
         }
       } else if (device.equals(nnApi)) {
         classifier.useNNAPI();
@@ -682,7 +740,10 @@ public class Camera2BasicFragment extends Fragment
     backgroundHandler = new Handler(backgroundThread.getLooper());
     // Start the classification train & load an initial model.
     synchronized (lock) {
-      runClassifier = true;
+      //runClassifier = true;
+
+      // only run when there is a frame available
+      runClassifier = false;
     }
     backgroundHandler.post(periodicClassify);
     updateActiveModel();
@@ -710,7 +771,15 @@ public class Camera2BasicFragment extends Fragment
         public void run() {
           synchronized (lock) {
             if (runClassifier) {
-              classifyFrame();
+              if (classifier != null) {
+                  if (classifier.getInputSsboId() == 0) {
+                    classifyFrame();
+                  } else {
+                    // wait until next frame in the SurfaceTexture frame listener in onFrameAvailable()
+                    classifyFrameSSBO();
+                    runClassifier = false;
+                  }
+              }
             }
           }
           backgroundHandler.post(periodicClassify);
@@ -733,9 +802,48 @@ public class Camera2BasicFragment extends Fragment
       previewRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
       previewRequestBuilder.addTarget(surface);
 
+
+
+      // create SSBO
+      initSsbo();
+
+      // create a new surface texture to get the camera frame by using GLES texture name
+      int preview_cx = previewSize.getWidth();
+      int preview_cy = previewSize.getHeight();
+
+      camSurfTex = new SurfaceTexture(camTexId);
+      camSurfTex.setDefaultBufferSize(preview_cx, preview_cy);
+
+      // create a camera surface target
+      Surface camSurf = new Surface (camSurfTex);
+      SurfaceTexture.OnFrameAvailableListener camFrameListener = new SurfaceTexture.OnFrameAvailableListener() {
+        @Override
+        public void onFrameAvailable(SurfaceTexture surfaceTexture) {
+          //camSurfTex.updateTexImage();
+
+          synchronized(lock) {
+            runClassifier = true;
+          }
+          //if (classifier != null && camSsboId != 0 && classifier.getOutputSsboId() != 0) {
+          //  long startTime = SystemClock.uptimeMillis();
+          //  classifier.displayOutputSsboToTextureView();
+          //  long endTime = SystemClock.uptimeMillis();
+          //  Log.d(TAG, "Time cost to display output SSBO: " + Long.toString(endTime - startTime));
+          //  Log.d(TAG, "------------------------------------------------------------");
+          //}
+        }
+      };
+
+      camSurfTex.setOnFrameAvailableListener(camFrameListener);
+
+      previewRequestBuilder.addTarget(camSurf);
+
+
       // Here, we create a CameraCaptureSession for camera preview.
       cameraDevice.createCaptureSession(
-          Arrays.asList(surface),
+          //Arrays.asList(surface),
+          Arrays.asList(surface, camSurf),
+          //Arrays.asList(camSurf),
           new CameraCaptureSession.StateCallback() {
 
             @Override
@@ -822,6 +930,42 @@ public class Camera2BasicFragment extends Fragment
     showToast(textToShow);
   }
 
+  // classify the frame using SSBO
+  private void classifyFrameSSBO() {
+    if (classifier == null || getActivity() == null || cameraDevice == null) {
+      // It's important to not call showToast every frame, or else the app will starve and
+      // hang. updateActiveModel() already puts a error message up with showToast.
+      // showToast("Uninitialized Classifier or invalid context.");
+      return;
+    }
+
+    SpannableStringBuilder textToShow = new SpannableStringBuilder();
+    //Bitmap bitmap = textureView.getBitmap(classifier.getImageSizeX(), classifier.getImageSizeY());
+    //classifier.classifyFrame(bitmap, textToShow);
+    //bitmap.recycle();
+
+
+    // update the texture image to get the camera frame
+    camSurfTex.updateTexImage();
+
+    // set gles context
+    EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+
+    // copy the surface to texture
+    long copy_t0 = SystemClock.uptimeMillis();
+    copyCamTexToSsbo();
+    long copy_t1 = SystemClock.uptimeMillis();
+
+    // classify the frame in the SSBO
+    EGL14.eglMakeCurrent(gpuDisplay, gpuSurface, gpuSurface, gpuContext);
+    classifier.classifyFrameSSBO(textToShow, copy_t1 - copy_t0);
+
+    // resumes the normal egl context
+    EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+
+    showToast(textToShow);
+  }
+
   /** Compares two {@code Size}s based on their areas. */
   private static class CompareSizesByArea implements Comparator<Size> {
 
@@ -861,5 +1005,259 @@ public class Camera2BasicFragment extends Fragment
               })
           .create();
     }
+  }
+
+
+
+  // create a texture name
+  private int createTextureName () {
+    // create texture name
+    int[] texIds = new int[1];
+    GLES31.glGenTextures(texIds.length, texIds, 0);
+
+    if (texIds[0] == 0) {
+      throw new RuntimeException("cannot create texture name.");
+    }
+
+    int texId = texIds[0];
+
+    return texId;
+  }
+
+  // create an SSBO buffer object and returns the ID name
+  // default to 3 channels and float size = 4.
+  private int createSSBO (int cx, int cy) {
+    int[] ssboIds = new int[1];
+    GLES31.glGenBuffers(ssboIds.length, ssboIds, 0);
+
+    int ssboId = ssboIds[0];
+    GLES31.glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboId);
+
+    if (ssboId == 0) {
+      throw new RuntimeException("cannot create SSBO.");
+    }
+
+    ByteBuffer ssboData = null;
+
+    int PIXEL_SIZE = 3;
+    int FLOAT_BYTE_SIZE = 4;
+    int ssboSize = cx * cy * PIXEL_SIZE * FLOAT_BYTE_SIZE;
+
+    //+++++ for debug purpose
+    boolean DEBUG = false;
+    if (DEBUG) {
+      // byte buffer to initialize ssbo buffer
+      ssboData = ByteBuffer.allocateDirect(ssboSize);
+      ssboData.order(ByteOrder.nativeOrder());
+
+      // create a left-to-right gradient
+      for (int y=0; y<cy; y++) {
+        for (int x=0; x<cx; x++) {
+          float r = 0.0f;
+          float g = ((float)(x))/((float)cx);
+          float b = 0.0f;
+
+          ssboData.putFloat(r);
+          ssboData.putFloat(g);
+          ssboData.putFloat(b);
+        }
+      }
+
+      ssboData.rewind();
+    }
+    //----- for debug purpose
+
+    GLES31.glBufferData(GL_SHADER_STORAGE_BUFFER, ssboSize, ssboData, GL_STREAM_COPY);
+
+    GLES31.glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);  // unbind output ssbo
+
+    return ssboId;
+  }
+
+  // image size should be always smaller than camera size
+  //  cam_cx >= img_cy
+  //  cam_cy >= img_cy
+  private int createShaderProgram_TexToSsbo (int cam_cx, int cam_cy, int img_cx, int img_cy) {
+    // create ssbo --> texture shader program
+    String shaderCode =
+            "   #version 310 es\n" +
+                    "   #extension GL_OES_EGL_image_external_essl3: enable\n" +
+                    "   precision mediump float;\n" + // need to specify 'mediump' for float
+                    "   layout(local_size_x = 16, local_size_y = 16) in;\n" +
+                    //"   layout(binding = 0) uniform sampler2D in_data; \n" +
+                    "   layout(binding = 0) uniform samplerExternalOES in_data; \n" +
+                    "   layout(std430) buffer;\n" +
+                    "   layout(binding = 1) buffer Input { float elements[]; } out_data;\n" +
+                    "   void main() {\n" +
+                    "     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);\n" +
+                    "     if (gid.x >= " + img_cx + " || gid.y >= " + img_cy + ") return;\n" +
+                    "     vec2 uv = vec2(gl_GlobalInvocationID.xy) / " + img_cx + ".0;\n" +
+                    "     vec4 pixel = texture (in_data, uv);\n" +
+                    "     int idx = 3 * (gid.y * " + img_cx + " + gid.x);\n" +
+                    //"     if (gid.x >= 120) pixel.x = 1.0;\n" + // DEBUG...
+                    "     out_data.elements[idx + 0] = pixel.x;\n" +
+                    "     out_data.elements[idx + 1] = pixel.y;\n" +
+                    "     out_data.elements[idx + 2] = pixel.z;\n" +
+                    "   }";
+
+    int shader = GLES31.glCreateShader(GL_COMPUTE_SHADER);
+    GLES31.glShaderSource(shader, shaderCode);
+    GLES31.glCompileShader(shader);
+
+    int[] compiled = new int [1];
+    GLES31.glGetShaderiv(shader, GLES31.GL_COMPILE_STATUS, compiled, 0);
+    if (compiled[0] == 0) {
+      // shader compilation failed
+      String log = "shader - compilation error: " + GLES31.glGetShaderInfoLog(shader);
+
+      Log.i(TAG, log);
+      throw new RuntimeException(log);
+    }
+
+    int progId = GLES31.glCreateProgram();
+    if (progId == 0) {
+      String log = "shader - cannot create program";
+
+      Log.i(TAG, log);
+      throw new RuntimeException(log);
+    }
+
+    GLES31.glAttachShader(progId, shader);
+    GLES31.glLinkProgram (progId);
+
+    int[] linked = new int[1];
+    GLES31.glGetProgramiv(progId, GLES31.GL_LINK_STATUS, linked, 0);
+    if (linked[0] == 0) {
+      String log = "shader - link error - log: " + GLES31.glGetProgramInfoLog(progId);
+
+      Log.i(TAG, log);
+      throw new RuntimeException(log);
+    }
+
+    return progId;
+  }
+
+  // copies camera surface texture to ssbo
+  void copyCamTexToSsbo () {
+    // bind camera input texture to GL_TEXTURE_EXTERNAL_OES.
+
+    // only copy up to classifier image size
+    int img_cx = classifier.getImageSizeX();//previewSize.getWidth();
+    int img_cy = classifier.getImageSizeY();//previewSize.getHeight();
+
+    int FLOAT_BYTE_SIZE = 4;
+    int camSsboSize = img_cx * img_cy * 3 * FLOAT_BYTE_SIZE;  // input ssbo to tflite gpu delegate has 3 channels
+
+    // updateTexImage() binds the texture to GL_TEXTURE_EXTERNAL_OES
+    GLES31.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, camTexId);
+    GLES31.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, camSsboId, 0, camSsboSize);
+
+    GLES31.glUseProgram(camToSsboProgId);
+    GLES31.glDispatchCompute(img_cx / 16, img_cy / 16, 1);  // these are work group sizes
+
+    GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT);
+
+    GLES31.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0);  // unbind
+    GLES31.glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);  // unbind
+    //GLES31.glBindTexture(GL_TEXTURE_2D, 0);  // unbind
+  }
+
+  // sharedCntx should be EGL_NO_CONTEXT if no context to be shared with.
+  private void initGLES (EGLContext[] context, EGLDisplay[] display, EGLConfig[] config, EGLSurface[] surface, EGLContext sharedCntx){
+
+    EGLDisplay disp = null;
+    EGLContext cntx = null;
+    EGLConfig  cfig = null;
+    EGLSurface surf = null;
+
+    // egl init
+    disp = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+    if (disp == null) {
+      throw new RuntimeException("unable to get EGL14 display");
+    }
+
+    int[] vers = new int[2];
+    if (!EGL14.eglInitialize(disp, vers, 0, vers, 1)) {
+      throw new RuntimeException("unable to initialize EGL14 display");
+    }
+
+    int[] configAttr = {
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT | EGLExt.EGL_OPENGL_ES3_BIT_KHR,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
+            EGL14.EGL_NONE
+    };
+
+    EGLConfig[] configs = new EGLConfig[1];
+    int[] numConfig = new int[1];
+    EGL14.eglChooseConfig(disp, configAttr, 0,
+            configs, 0, 1, numConfig, 0);
+    if (numConfig[0] == 0) {
+      throw new RuntimeException("unable to choose config for EGL14 display");
+    }
+    cfig = configs[0];
+
+    int[] ctxAttrib = {
+            EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,
+            EGL14.EGL_NONE
+    };
+
+    // create egl context
+    cntx = EGL14.eglCreateContext(disp, cfig, sharedCntx, ctxAttrib, 0);  // needs a shared context for a shared ssbo.
+    if (cntx.equals(EGL_NO_CONTEXT)) {
+      throw new RuntimeException("unable to create EGL14 context");
+    }
+    //Log.i(TAG, "Camera2BasicFragment - created egl context");
+
+
+    // create a dummy surface as no on-screen drawing is needed
+    SurfaceTexture dummySurf = new SurfaceTexture(true);
+
+    // the surface is to display the output to the screen
+    int[] dummySurfAttrib = {
+            EGL14.EGL_NONE
+    };
+    surf = EGL14.eglCreateWindowSurface(disp, cfig, dummySurf, dummySurfAttrib, 0);
+
+    context[0] = cntx;
+    display[0] = disp;
+    config [0] = cfig;
+    surface[0] = surf;
+  }
+
+  // init SSBO
+  void initSsbo () {
+    // add an off-screen surface target, so pixels can be retrieved from cam preview frames.
+    int preview_cx = previewSize.getWidth();
+    int preview_cy = previewSize.getHeight();
+
+    // init GLES
+    EGLDisplay[] display = new EGLDisplay[1];
+    EGLContext[] context = new EGLContext[1];
+    EGLConfig [] config  = new EGLConfig [1];
+    EGLSurface[] surface = new EGLSurface[1];
+
+    initGLES(context, display, config, surface, EGL14.EGL_NO_CONTEXT);
+    eglDisplay = display[0];
+    eglContext = context[0];
+    eglConfig  = config [0];
+    eglSurface = surface[0];
+
+    // make the context current for current thread, display and surface.
+    EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+
+    // TODO: remove hard code.
+    int img_cx = 224;
+    int img_cy = 224;
+
+    //==========  cam -> tex -> ssbo  ==========
+    // create a texture name
+    camTexId = createTextureName();
+
+    camSsboId = createSSBO(img_cx, img_cy);
+    camToSsboProgId = createShaderProgram_TexToSsbo(preview_cx, preview_cy, img_cx, img_cy);
   }
 }
