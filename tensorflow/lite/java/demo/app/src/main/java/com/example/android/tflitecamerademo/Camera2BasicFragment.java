@@ -173,6 +173,9 @@ public class Camera2BasicFragment extends Fragment
   /** An {@link AutoFitTextureView} for camera preview. */
   private AutoFitTextureView textureView;
 
+  // test output view
+  private AutoFitTextureView glesView;
+
   /** A {@link CameraCaptureSession } for camera preview. */
   private CameraCaptureSession captureSession;
 
@@ -452,6 +455,9 @@ public class Camera2BasicFragment extends Fragment
     textView = (TextView) view.findViewById(R.id.text);
     deviceView = (ListView) view.findViewById(R.id.device);
     modelView = (ListView) view.findViewById(R.id.model);
+
+    // a real on-display view
+    glesView = (AutoFitTextureView) view.findViewById(R.id.gles);
 
     // Build list of models
     modelStrings.add(mobilenetV1Quant);
@@ -1080,7 +1086,7 @@ public class Camera2BasicFragment extends Fragment
   private int createShaderProgram_TexToSsbo (int cam_cx, int cam_cy, int img_cx, int img_cy) {
     // create ssbo --> texture shader program
     String shaderCode =
-            "   #version 310 es\n" +
+                    "   #version 310 es\n" +
                     "   #extension GL_OES_EGL_image_external_essl3: enable\n" +
                     "   precision mediump float;\n" + // need to specify 'mediump' for float
                     "   layout(local_size_x = 16, local_size_y = 16) in;\n" +
@@ -1159,10 +1165,10 @@ public class Camera2BasicFragment extends Fragment
 
     GLES31.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0);  // unbind
     GLES31.glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);  // unbind
-    //GLES31.glBindTexture(GL_TEXTURE_2D, 0);  // unbind
   }
 
   // sharedCntx should be EGL_NO_CONTEXT if no context to be shared with.
+  // set surface to null if no dummy surface is needed
   private void initGLES (EGLContext[] context, EGLDisplay[] display, EGLConfig[] config, EGLSurface[] surface, EGLContext sharedCntx){
 
     EGLDisplay disp = null;
@@ -1213,19 +1219,22 @@ public class Camera2BasicFragment extends Fragment
     //Log.i(TAG, "Camera2BasicFragment - created egl context");
 
 
-    // create a dummy surface as no on-screen drawing is needed
-    SurfaceTexture dummySurf = new SurfaceTexture(true);
-
-    // the surface is to display the output to the screen
-    int[] dummySurfAttrib = {
-            EGL14.EGL_NONE
-    };
-    surf = EGL14.eglCreateWindowSurface(disp, cfig, dummySurf, dummySurfAttrib, 0);
-
     context[0] = cntx;
     display[0] = disp;
     config [0] = cfig;
-    surface[0] = surf;
+
+    if (surface != null) {
+      // create a dummy surface as no on-screen drawing is needed
+      SurfaceTexture dummySurf = new SurfaceTexture(true);
+
+      // the surface is to display the output to the screen
+      int[] dummySurfAttrib = {
+              EGL14.EGL_NONE
+      };
+      surf = EGL14.eglCreateWindowSurface(disp, cfig, dummySurf, dummySurfAttrib, 0);
+
+      surface[0] = surf;
+    }
   }
 
   // init SSBO
@@ -1240,11 +1249,23 @@ public class Camera2BasicFragment extends Fragment
     EGLConfig [] config  = new EGLConfig [1];
     EGLSurface[] surface = new EGLSurface[1];
 
-    initGLES(context, display, config, surface, EGL14.EGL_NO_CONTEXT);
+    initGLES(context, display, config, null, EGL14.EGL_NO_CONTEXT);
     eglDisplay = display[0];
     eglContext = context[0];
     eglConfig  = config [0];
-    eglSurface = surface[0];
+    //eglSurface = surface[0];
+
+    // create a real on-display surface that associates GLES
+    int[] eglSurfaceAttribs = {
+            EGL14.EGL_NONE
+    };
+
+    // On Pixel 3 (Android P, Snapdragon 845), a real on-display surface needs to be associated to make
+    //      compute shader works.
+    // On LG G4 (Android M, Snapdragon 808), however, only a dummy surface is needed.
+    // For Pixel 3 and LG G4, a real on-display surface works on both devices.
+    SurfaceTexture outputSurf = glesView.getSurfaceTexture();
+    eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, eglConfig, outputSurf, eglSurfaceAttribs, 0);
 
     // make the context current for current thread, display and surface.
     EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
