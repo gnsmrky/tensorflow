@@ -1089,7 +1089,8 @@ public class Camera2BasicFragment extends Fragment
                     "   #version 310 es\n" +
                     "   #extension GL_OES_EGL_image_external_essl3: enable\n" +
                     "   precision mediump float;\n" + // need to specify 'mediump' for float
-                    "   layout(local_size_x = 16, local_size_y = 16) in;\n" +
+                    //"   layout(local_size_x = 16, local_size_y = 16) in;\n" +
+                    "   layout(local_size_x = 8, local_size_y = 8) in;\n" +
                     //"   layout(binding = 0) uniform sampler2D in_data; \n" +
                     "   layout(binding = 0) uniform samplerExternalOES in_data; \n" +
                     "   layout(std430) buffer;\n" +
@@ -1159,7 +1160,8 @@ public class Camera2BasicFragment extends Fragment
     GLES31.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, camSsboId, 0, camSsboSize);
 
     GLES31.glUseProgram(camToSsboProgId);
-    GLES31.glDispatchCompute(img_cx / 16, img_cy / 16, 1);  // these are work group sizes
+    //GLES31.glDispatchCompute(img_cx / 16, img_cy / 16, 1);  // these are work group sizes
+    GLES31.glDispatchCompute(img_cx / 8, img_cy / 8, 1);  // smaller work group sizes for lower end GPU.
 
     GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT);
 

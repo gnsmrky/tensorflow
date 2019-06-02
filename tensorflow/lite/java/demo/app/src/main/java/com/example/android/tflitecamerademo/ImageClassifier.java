@@ -219,6 +219,10 @@ public abstract class ImageClassifier {
   public void useGpu() {
     if (gpuDelegate == null) {
       gpuDelegate = new GpuDelegate();
+
+      // use only FP16 precision for lower memory requirement
+      tfliteOptions.setAllowFp16PrecisionForFp32(true);
+
       //tfliteOptions.addDelegate(gpuDelegate);
       //recreateInterpreter();
 
