@@ -83,6 +83,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 import static android.opengl.EGL14.EGL_NO_CONTEXT;
+import static android.opengl.GLES20.GL_BUFFER_SIZE;
 import static android.opengl.GLES30.GL_STREAM_COPY;
 import static android.opengl.GLES31.GL_COMPUTE_SHADER;
 import static android.opengl.GLES31.GL_SHADER_STORAGE_BUFFER;
@@ -1074,6 +1075,12 @@ public class Camera2BasicFragment extends Fragment
     //----- for debug purpose
 
     GLES31.glBufferData(GL_SHADER_STORAGE_BUFFER, ssboSize, ssboData, GL_STREAM_COPY);
+
+    int ssboSizeCreated [] = new int[1];
+    GLES31.glGetBufferParameteriv (GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, ssboSizeCreated, 0);
+    if (ssboSizeCreated[0] != ssboSize) {
+      throw new RuntimeException("cannot create SSBO with needed size.");
+    }
 
     GLES31.glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);  // unbind output ssbo
 
